@@ -204,11 +204,11 @@ func mapKeyValue(ctx context.Context, db *sql.DB, query string, args ...any) (ma
 
 	kv := map[string]string{}
 	for rows.Next() {
-		var key, value string
+		var key, value sql.NullString
 		if err := rows.Scan(&key, &value); err != nil {
 			return nil, err
 		}
-		kv[key] = value
+		kv[key.String] = value.String
 	}
 	if rows.Err() != nil {
 		return nil, rows.Err()
