@@ -16,6 +16,42 @@ func (op Operation) Normalized() string {
 	return normaliseSql(string(op))
 }
 
+const sqlIndices = `
+	SELECT
+		name,
+		sql
+	FROM
+		sqlite_master
+	WHERE
+		type = "index"
+	ORDER BY
+		name
+`
+
+const sqlTables = `
+	SELECT
+		name,
+		sql
+	FROM
+		sqlite_master
+	WHERE
+		type = "table"
+	AND
+		name != "sqlite_sequence"
+	ORDER BY
+		name
+`
+
+const sqlColumns = `
+	SELECT
+        name,
+        json_array(cid, type, "notnull", dflt_value, pk)
+    FROM
+        pragma_table_info($1)
+    ORDER BY
+        cid
+`
+
 func Plan(ctx context.Context, actual *sql.DB, schema string, allowDeletions bool) ([]Operation, error) {
 	wanted, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
@@ -31,20 +67,20 @@ func Plan(ctx context.Context, actual *sql.DB, schema string, allowDeletions boo
 		ops = append(ops, Operation(query))
 	}
 
-	wantedTables, err := listTables(ctx, wanted)
+	wantedTables, err := mapKeyValue(ctx, wanted, sqlTables)
 	if err != nil {
 		return nil, err
 	}
-	wantedIndices, err := listIndices(ctx, wanted)
+	wantedIndices, err := mapKeyValue(ctx, wanted, sqlIndices)
 	if err != nil {
 		return nil, err
 	}
 
-	actualTables, err := listTables(ctx, actual)
+	actualTables, err := mapKeyValue(ctx, actual, sqlTables)
 	if err != nil {
 		return nil, err
 	}
-	actualIndices, err := listIndices(ctx, actual)
+	actualIndices, err := mapKeyValue(ctx, actual, sqlIndices)
 	if err != nil {
 		return nil, err
 	}
@@ -80,12 +116,12 @@ func Plan(ctx context.Context, actual *sql.DB, schema string, allowDeletions boo
 		sql := strings.ReplaceAll(wantedTables[tableName], tableName, tmpName)
 		addOperation(sql)
 
-		wantedColumns, err := listColumns(ctx, wanted, tableName)
+		wantedColumns, err := mapKeyValue(ctx, wanted, sqlColumns, tableName)
 		if err != nil {
 			return nil, err
 		}
 
-		actualColumns, err := listColumns(ctx, actual, tableName)
+		actualColumns, err := mapKeyValue(ctx, actual, sqlColumns, tableName)
 		if err != nil {
 			return nil, err
 		}
@@ -159,101 +195,25 @@ func diffValues[K comparable, V any](a, b map[K]V, comparator func(a, b V) bool)
 	return c
 }
 
-func listTables(ctx context.Context, db *sql.DB) (map[string]string, error) {
-	rows, err := db.QueryContext(ctx, `
-		SELECT name, sql
-		FROM sqlite_master
-		WHERE type = "table"
-		AND name != "sqlite_sequence"
-	`)
+func mapKeyValue(ctx context.Context, db *sql.DB, query string, args ...any) (map[string]string, error) {
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	tables := map[string]string{}
+	kv := map[string]string{}
 	for rows.Next() {
-		var name, schemaString string
-		if err := rows.Scan(&name, &schemaString); err != nil {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
 			return nil, err
 		}
-		tables[name] = schemaString
+		kv[key] = value
 	}
 	if rows.Err() != nil {
 		return nil, rows.Err()
 	}
-	return tables, nil
-}
-
-type Column struct {
-	ID         int64
-	Name       string
-	Type       string
-	NotNull    bool
-	Default    []byte
-	PrimaryKey int
-}
-
-func listColumns(ctx context.Context, db *sql.DB, tableName string) (map[string]Column, error) {
-	// TODO schema name might be required in pragma_table_info()
-	rows, err := db.QueryContext(ctx, `
-		SELECT
-            cid,
-            name,
-            type,
-            "notnull",
-            dflt_value,
-            pk
-        FROM
-            pragma_table_info($1)
-        ORDER BY
-            cid
-    `, tableName)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	columns := map[string]Column{}
-	for rows.Next() {
-		var col Column
-		if err := rows.Scan(
-			&col.ID,
-			&col.Name,
-			&col.Type,
-			&col.NotNull,
-			&col.Default,
-			&col.PrimaryKey,
-		); err != nil {
-			return nil, err
-		}
-		columns[col.Name] = col
-	}
-	if rows.Err() != nil {
-		return nil, rows.Err()
-	}
-	return columns, nil
-}
-
-func listIndices(ctx context.Context, db *sql.DB) (map[string]string, error) {
-	rows, err := db.QueryContext(ctx, `SELECT name, sql FROM sqlite_master WHERE type = "index"`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	tables := map[string]string{}
-	for rows.Next() {
-		var name, sql string
-		if err := rows.Scan(&name, &sql); err != nil {
-			return nil, err
-		}
-		tables[name] = sql
-	}
-	if rows.Err() != nil {
-		return nil, rows.Err()
-	}
-	return tables, nil
+	return kv, nil
 }
 
 var reRemoveComments = regexp.MustCompile(`--.*?\n`)
