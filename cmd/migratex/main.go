@@ -15,7 +15,15 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+func getenv(e string, d string) string {
+	if v, ok := os.LookupEnv(e); ok {
+		return v
+	}
+	return d
+}
+
 func main() {
+	flagSchema := flag.String("schema", getenv("SCHEMA", "/dev/stdin"), "path to schema ($SCHEMA)")
 	flagAutoApply := flag.Bool("auto-apply", false, "apply plan without asking")
 	flagAllowDeletions := flag.Bool("allow-deletions", false, "unless set deletions are not allowed")
 	flag.Parse()
@@ -48,7 +56,13 @@ func main() {
 	}
 
 	// Define the new schema as SQL text
-	schema, err := io.ReadAll(os.Stdin)
+	f, err := os.Open(*flagSchema)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer f.Close()
+
+	schema, err := io.ReadAll(f)
 	if err != nil {
 		log.Fatal(err)
 	}
