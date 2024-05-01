@@ -42,6 +42,34 @@ const sqlTables = `
 		name
 `
 
+const sqlViews = `
+	SELECT
+		name,
+		sql
+	FROM
+		sqlite_master
+	WHERE
+		type = "view"
+	AND
+		name != "sqlite_sequence"
+	ORDER BY
+		name
+`
+
+const sqlTriggers = `
+	SELECT
+		name,
+		sql
+	FROM
+		sqlite_master
+	WHERE
+		type = "trigger"
+	AND
+		name != "sqlite_sequence"
+	ORDER BY
+		name
+`
+
 const sqlColumns = `
 	SELECT
         name,
@@ -75,6 +103,14 @@ func Plan(ctx context.Context, actual *sql.DB, schema string, allowDeletions boo
 	if err != nil {
 		return nil, err
 	}
+	wantedTriggers, err := mapKeyValue(ctx, wanted, sqlTriggers)
+	if err != nil {
+		return nil, err
+	}
+	wantedViews, err := mapKeyValue(ctx, wanted, sqlViews)
+	if err != nil {
+		return nil, err
+	}
 
 	actualTables, err := mapKeyValue(ctx, actual, sqlTables)
 	if err != nil {
@@ -84,18 +120,31 @@ func Plan(ctx context.Context, actual *sql.DB, schema string, allowDeletions boo
 	if err != nil {
 		return nil, err
 	}
+	actualTriggers, err := mapKeyValue(ctx, actual, sqlTriggers)
+	if err != nil {
+		return nil, err
+	}
+	actualViews, err := mapKeyValue(ctx, actual, sqlViews)
+	if err != nil {
+		return nil, err
+	}
 
 	eqSql := func(a, b string) bool {
 		return normaliseSql(a) == normaliseSql(b)
 	}
 
-	// TODO support migration of views and triggers too
 	addedTables := diffKeys(actualTables, wantedTables)
 	removedTables := diffKeys(wantedTables, actualTables)
 	modifiedTables := diffValues(wantedTables, actualTables, eqSql)
 	addedIndices := diffKeys(actualIndices, wantedIndices)
 	removedIndices := diffKeys(wantedIndices, actualIndices)
 	modifiedIndices := diffValues(wantedIndices, actualIndices, eqSql)
+	addedViews := diffKeys(actualViews, wantedViews)
+	removedViews := diffKeys(wantedViews, actualViews)
+	modifiedViews := diffValues(wantedViews, actualViews, eqSql)
+	addedTriggers := diffKeys(actualTriggers, wantedTriggers)
+	removedTriggers := diffKeys(wantedTriggers, actualTriggers)
+	modifiedTriggers := diffValues(wantedTriggers, actualTriggers, eqSql)
 
 	if len(removedTables) > 0 && !allowDeletions {
 		return nil, fmt.Errorf("will not remove tables: %v", removedTables)
@@ -151,13 +200,33 @@ func Plan(ctx context.Context, actual *sql.DB, schema string, allowDeletions boo
 		removedIndices = append(removedIndices, name)
 		addedIndices = append(addedIndices, name)
 	}
+	for _, name := range modifiedViews {
+		removedViews = append(removedViews, name)
+		addedViews = append(addedViews, name)
+	}
+	for _, name := range modifiedTriggers {
+		removedTriggers = append(removedTriggers, name)
+		addedTriggers = append(addedTriggers, name)
+	}
 
 	for _, name := range removedIndices {
 		addOperation(fmt.Sprintf(`DROP INDEX "%s"`, name))
 	}
+	for _, name := range removedViews {
+		addOperation(fmt.Sprintf(`DROP VIEW "%s"`, name))
+	}
+	for _, name := range removedTriggers {
+		addOperation(fmt.Sprintf(`DROP TRIGGER "%s"`, name))
+	}
 
 	for _, name := range addedIndices {
 		addOperation(wantedIndices[name])
+	}
+	for _, name := range addedViews {
+		addOperation(wantedViews[name])
+	}
+	for _, name := range addedTriggers {
+		addOperation(wantedTriggers[name])
 	}
 
 	return ops, nil
