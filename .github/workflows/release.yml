@@ -1,0 +1,44 @@
+name: Go
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, windows, darwin]
+        arch: [amd64, arm64]
+    env:
+      BIN: migratex-${{ matrix.goos }}-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test -v ./...
+
+      - name: Build
+        run: go build -ldflags '-s -w -X main.version=${{ github.event.release.tag_name }}' -o $BIN -v github.com/middle-management/migratex/cmd/migratex
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+
+      - name: Upload
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            github.rest.repos.uploadReleaseAsset({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: context.payload.release.id,
+              name: process.env.BIN,
+              data: fs.readFileSync(process.env.BIN)
+            })
