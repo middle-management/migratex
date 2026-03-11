@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/middle-management/migratex"
@@ -140,5 +141,129 @@ func TestMigrate(t *testing.T) {
 	}
 	if x.String != "x" {
 		t.Error("invalid x", x)
+	}
+}
+
+func TestMigrateVirtualTable(t *testing.T) {
+	db, err := sql.Open("sqlite", "test_vt.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove("test_vt.db")
+	defer db.Close()
+
+	ctx := context.TODO()
+
+	schema := `
+		CREATE TABLE product (
+			id INTEGER PRIMARY KEY,
+			name TEXT,
+			normalized_name TEXT
+		);
+		CREATE VIRTUAL TABLE product_fts USING fts5(
+			name, normalized_name,
+			content=product, content_rowid=id,
+			tokenize='unicode61 remove_diacritics 2'
+		);
+	`
+
+	// Initial migration should succeed
+	err = migratex.Migrate(ctx, db, schema, false)
+	if err != nil {
+		t.Fatal("initial migration failed:", err)
+	}
+
+	// Plan with same schema should produce no operations (idempotent)
+	ops, err := migratex.Plan(ctx, db, schema, false)
+	if err != nil {
+		t.Fatal("plan failed:", err)
+	}
+	if len(ops) != 0 {
+		for i, op := range ops {
+			t.Logf("  op[%d]: %s", i, op.Normalized())
+		}
+		t.Fatalf("expected 0 ops for identical schema, got %d", len(ops))
+	}
+
+	// Insert data and verify FTS works
+	_, err = db.ExecContext(ctx, `INSERT INTO product (id, name, normalized_name) VALUES (1, 'Café Latte', 'cafe latte')`)
+	if err != nil {
+		t.Fatal("insert failed:", err)
+	}
+	_, err = db.ExecContext(ctx, `INSERT INTO product_fts (rowid, name, normalized_name) VALUES (1, 'Café Latte', 'cafe latte')`)
+	if err != nil {
+		t.Fatal("fts insert failed:", err)
+	}
+
+	var matchedName string
+	err = db.QueryRowContext(ctx, `SELECT name FROM product_fts WHERE product_fts MATCH 'cafe'`).Scan(&matchedName)
+	if err != nil {
+		t.Fatal("fts query failed:", err)
+	}
+	if matchedName != "Café Latte" {
+		t.Errorf("expected 'Café Latte', got %q", matchedName)
+	}
+
+	// Modified virtual table schema should produce drop + create ops
+	modifiedSchema := `
+		CREATE TABLE product (
+			id INTEGER PRIMARY KEY,
+			name TEXT,
+			normalized_name TEXT
+		);
+		CREATE VIRTUAL TABLE product_fts USING fts5(
+			name, normalized_name,
+			content=product, content_rowid=id,
+			tokenize='unicode61 remove_diacritics 1'
+		);
+	`
+	ops, err = migratex.Plan(ctx, db, modifiedSchema, false)
+	if err != nil {
+		t.Fatal("plan with modified virtual table failed:", err)
+	}
+	if len(ops) != 2 {
+		for i, op := range ops {
+			t.Logf("  op[%d]: %s", i, op.Normalized())
+		}
+		t.Fatalf("expected 2 ops (drop + create) for modified virtual table, got %d", len(ops))
+	}
+	if !strings.Contains(string(ops[0]), "DROP TABLE") {
+		t.Errorf("expected first op to be DROP TABLE, got: %s", ops[0])
+	}
+	if !strings.Contains(string(ops[1]), "CREATE VIRTUAL TABLE") {
+		t.Errorf("expected second op to be CREATE VIRTUAL TABLE, got: %s", ops[1])
+	}
+
+	// Adding a new virtual table alongside existing one
+	extendedSchema := `
+		CREATE TABLE product (
+			id INTEGER PRIMARY KEY,
+			name TEXT,
+			normalized_name TEXT
+		);
+		CREATE VIRTUAL TABLE product_fts USING fts5(
+			name, normalized_name,
+			content=product, content_rowid=id,
+			tokenize='unicode61 remove_diacritics 2'
+		);
+		CREATE TABLE category (
+			id INTEGER PRIMARY KEY,
+			name TEXT
+		);
+		CREATE VIRTUAL TABLE category_fts USING fts5(
+			name,
+			content=category, content_rowid=id
+		);
+	`
+	ops, err = migratex.Plan(ctx, db, extendedSchema, false)
+	if err != nil {
+		t.Fatal("plan with added virtual table failed:", err)
+	}
+	// Should add category table + category_fts virtual table (2 ops)
+	if len(ops) != 2 {
+		for i, op := range ops {
+			t.Logf("  op[%d]: %s", i, op.Normalized())
+		}
+		t.Fatalf("expected 2 ops (add table + add virtual table), got %d", len(ops))
 	}
 }
