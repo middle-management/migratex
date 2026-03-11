@@ -38,6 +38,22 @@ const sqlTables = `
 		type = "table"
 	AND
 		name != "sqlite_sequence"
+	AND
+		sql NOT LIKE 'CREATE VIRTUAL TABLE%'
+	ORDER BY
+		name
+`
+
+const sqlVirtualTables = `
+	SELECT
+		name,
+		sql
+	FROM
+		sqlite_master
+	WHERE
+		type = "table"
+	AND
+		sql LIKE 'CREATE VIRTUAL TABLE%'
 	ORDER BY
 		name
 `
@@ -111,6 +127,10 @@ func Plan(ctx context.Context, actual *sql.DB, schema string, allowDeletions boo
 	if err != nil {
 		return nil, err
 	}
+	wantedVirtualTables, err := mapKeyValue(ctx, wanted, sqlVirtualTables)
+	if err != nil {
+		return nil, err
+	}
 
 	actualTables, err := mapKeyValue(ctx, actual, sqlTables)
 	if err != nil {
@@ -128,6 +148,14 @@ func Plan(ctx context.Context, actual *sql.DB, schema string, allowDeletions boo
 	if err != nil {
 		return nil, err
 	}
+	actualVirtualTables, err := mapKeyValue(ctx, actual, sqlVirtualTables)
+	if err != nil {
+		return nil, err
+	}
+
+	// Filter out shadow tables created by virtual tables (e.g. FTS5)
+	wantedTables = filterShadowTables(wantedTables, wantedVirtualTables, actualVirtualTables)
+	actualTables = filterShadowTables(actualTables, wantedVirtualTables, actualVirtualTables)
 
 	eqSql := func(a, b string) bool {
 		return normaliseSql(a) == normaliseSql(b)
@@ -136,6 +164,9 @@ func Plan(ctx context.Context, actual *sql.DB, schema string, allowDeletions boo
 	addedTables := diffKeys(actualTables, wantedTables)
 	removedTables := diffKeys(wantedTables, actualTables)
 	modifiedTables := diffValues(wantedTables, actualTables, eqSql)
+	addedVirtualTables := diffKeys(actualVirtualTables, wantedVirtualTables)
+	removedVirtualTables := diffKeys(wantedVirtualTables, actualVirtualTables)
+	modifiedVirtualTables := diffValues(wantedVirtualTables, actualVirtualTables, eqSql)
 	addedIndices := diffKeys(actualIndices, wantedIndices)
 	removedIndices := diffKeys(wantedIndices, actualIndices)
 	modifiedIndices := diffValues(wantedIndices, actualIndices, eqSql)
@@ -148,6 +179,18 @@ func Plan(ctx context.Context, actual *sql.DB, schema string, allowDeletions boo
 
 	if len(removedTables) > 0 && !allowDeletions {
 		return nil, fmt.Errorf("will not remove tables: %v", removedTables)
+	}
+	if len(removedVirtualTables) > 0 && !allowDeletions {
+		return nil, fmt.Errorf("will not remove virtual tables: %v", removedVirtualTables)
+	}
+
+	// Drop removed/modified virtual tables before regular table operations,
+	// since virtual tables may reference regular tables being modified.
+	for _, name := range removedVirtualTables {
+		addOperation(fmt.Sprintf(`DROP TABLE "%s"`, name))
+	}
+	for _, name := range modifiedVirtualTables {
+		addOperation(fmt.Sprintf(`DROP TABLE "%s"`, name))
 	}
 
 	for _, name := range addedTables {
@@ -229,7 +272,40 @@ func Plan(ctx context.Context, actual *sql.DB, schema string, allowDeletions boo
 		addOperation(wantedTriggers[name])
 	}
 
+	// Create added/modified virtual tables after regular tables exist,
+	// since virtual tables may reference them (e.g. FTS5 content tables).
+	for _, name := range addedVirtualTables {
+		addOperation(wantedVirtualTables[name])
+	}
+	for _, name := range modifiedVirtualTables {
+		addOperation(wantedVirtualTables[name])
+	}
+
 	return ops, nil
+}
+
+// filterShadowTables removes shadow tables (created internally by virtual tables
+// like FTS5) from a table map. Shadow tables have names prefixed with the virtual
+// table name followed by an underscore.
+func filterShadowTables(tables map[string]string, virtualTableSets ...map[string]string) map[string]string {
+	filtered := make(map[string]string, len(tables))
+	for name, sql := range tables {
+		if !isShadowTable(name, virtualTableSets...) {
+			filtered[name] = sql
+		}
+	}
+	return filtered
+}
+
+func isShadowTable(name string, virtualTableSets ...map[string]string) bool {
+	for _, vts := range virtualTableSets {
+		for vtName := range vts {
+			if strings.HasPrefix(name, vtName+"_") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func ident(s string) string {
