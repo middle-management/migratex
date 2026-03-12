@@ -10,6 +10,11 @@ import (
 	"strings"
 )
 
+type Exclusions struct {
+	Tables  []string            // table names to fully exclude from migration
+	Columns map[string][]string // table name -> column names to exclude from diff
+}
+
 type Operation string
 
 func (op Operation) Normalized() string {
@@ -96,7 +101,7 @@ const sqlColumns = `
         cid
 `
 
-func Plan(ctx context.Context, actual *sql.DB, schema string, allowDeletions bool) ([]Operation, error) {
+func Plan(ctx context.Context, actual *sql.DB, schema string, allowDeletions bool, exclusions *Exclusions) ([]Operation, error) {
 	wanted, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		return nil, err
@@ -157,6 +162,14 @@ func Plan(ctx context.Context, actual *sql.DB, schema string, allowDeletions boo
 	wantedTables = filterShadowTables(wantedTables, wantedVirtualTables, actualVirtualTables)
 	actualTables = filterShadowTables(actualTables, wantedVirtualTables, actualVirtualTables)
 
+	// Filter out explicitly excluded tables
+	if exclusions != nil {
+		for _, name := range exclusions.Tables {
+			delete(wantedTables, name)
+			delete(actualTables, name)
+		}
+	}
+
 	eqSql := func(a, b string) bool {
 		return normaliseSql(a) == normaliseSql(b)
 	}
@@ -203,11 +216,6 @@ func Plan(ctx context.Context, actual *sql.DB, schema string, allowDeletions boo
 
 	suffix := "_migratex_" + strconv.Itoa(rand.Int())
 	for _, tableName := range modifiedTables {
-		// TODO make the replace a bit safer (this would replace columns and everything)
-		tmpName := tableName + suffix
-		sql := strings.ReplaceAll(wantedTables[tableName], tableName, tmpName)
-		addOperation(sql)
-
 		wantedColumns, err := mapKeyValue(ctx, wanted, sqlColumns, tableName)
 		if err != nil {
 			return nil, err
@@ -218,10 +226,31 @@ func Plan(ctx context.Context, actual *sql.DB, schema string, allowDeletions boo
 			return nil, err
 		}
 
+		// Filter out excluded columns for this table
+		if exclusions != nil {
+			for _, col := range exclusions.Columns[tableName] {
+				delete(wantedColumns, col)
+				delete(actualColumns, col)
+			}
+		}
+
+		// After filtering excluded columns, check if columns actually differ.
+		// If the only differences were in excluded columns, skip this table.
+		addedColumns := diffKeys(actualColumns, wantedColumns)
 		removedColumns := diffKeys(wantedColumns, actualColumns)
+		modifiedColumns := diffValues(wantedColumns, actualColumns, func(a, b string) bool { return a == b })
+		if len(addedColumns) == 0 && len(removedColumns) == 0 && len(modifiedColumns) == 0 {
+			continue
+		}
+
 		if len(removedColumns) > 0 && !allowDeletions {
 			return nil, fmt.Errorf("will not remove columns from table %s: %v", tableName, removedColumns)
 		}
+
+		// TODO make the replace a bit safer (this would replace columns and everything)
+		tmpName := tableName + suffix
+		sql := strings.ReplaceAll(wantedTables[tableName], tableName, tmpName)
+		addOperation(sql)
 
 		commonColumns := intersectKeys(wantedColumns, actualColumns)
 		var commonColumnsString string

@@ -28,7 +28,7 @@ func TestMigrate(t *testing.T) {
 			h TEXT
 		);
 		CREATE INDEX IF NOT EXISTS idx_node_a ON "Node" (A);
-	`, false)
+	`, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +46,7 @@ func TestMigrate(t *testing.T) {
 			h TEXT
 		);
 		CREATE INDEX IF NOT EXISTS idx_node_a ON "Node" (A);
-	`, false)
+	`, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestMigrate(t *testing.T) {
 			);
 			CREATE INDEX IF NOT EXISTS idx_node_a ON "Node" (A);
 			CREATE TABLE "Other" (x INT);
-		`, false)
+		`, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestMigrate(t *testing.T) {
 				);
 				CREATE INDEX IF NOT EXISTS idx_node_a ON "Node" (A);
 				CREATE TABLE "Other" (x INT);
-			`, false)
+			`, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestMigrate(t *testing.T) {
 				x TEXT DEFAULT 'x', -- invalid because of extra comma
 			);
 			CREATE INDEX IF NOT EXISTS idx_node_a ON "Node" (A);
-		`, false)
+		`, false, nil)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -114,7 +114,7 @@ func TestMigrate(t *testing.T) {
 			x TEXT DEFAULT 'x'
 		);
 		CREATE INDEX IF NOT EXISTS idx_node_a ON "Node" (A);
-	`, false)
+	`, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,6 +144,101 @@ func TestMigrate(t *testing.T) {
 	}
 }
 
+func TestExcludeTables(t *testing.T) {
+	db, err := sql.Open("sqlite", "test_exclude.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove("test_exclude.db")
+	defer db.Close()
+
+	ctx := context.TODO()
+
+	// Create the database with a table and some "internal" tables (like litestream creates)
+	_, err = db.ExecContext(ctx, `
+		CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+		CREATE TABLE _litestream_seq (id INTEGER PRIMARY KEY, seq INTEGER);
+		CREATE TABLE _litestream_lock (id INTEGER PRIMARY KEY);
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Schema only defines the users table - without exclude, Plan would want to drop the internal tables
+	schema := `CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);`
+
+	// Without exclude and without allow-deletions, Plan should error about removing tables
+	_, err = migratex.Plan(ctx, db, schema, false, nil)
+	if err == nil {
+		t.Fatal("expected error about removing tables without allow-deletions")
+	}
+
+	// With exclude, Plan should produce no ops since the internal tables are ignored
+	ops, err := migratex.Plan(ctx, db, schema, false, &migratex.Exclusions{
+		Tables: []string{"_litestream_seq", "_litestream_lock"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ops) != 0 {
+		for i, op := range ops {
+			t.Logf("  op[%d]: %s", i, op.Normalized())
+		}
+		t.Fatalf("expected 0 ops with excluded tables, got %d", len(ops))
+	}
+
+	// Excluded tables should still exist in the actual database
+	var count int
+	err = db.QueryRowContext(ctx, `SELECT count(*) FROM _litestream_seq`).Scan(&count)
+	if err != nil {
+		t.Fatal("excluded table _litestream_seq should still exist:", err)
+	}
+}
+
+func TestExcludeColumns(t *testing.T) {
+	db, err := sql.Open("sqlite", "test_exclude_cols.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove("test_exclude_cols.db")
+	defer db.Close()
+
+	ctx := context.TODO()
+
+	// Create a table with an extra column that only exists in the actual DB
+	_, err = db.ExecContext(ctx, `
+		CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, internal_seq INTEGER);
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Schema doesn't include internal_seq - without exclusion this would error or try to modify
+	schema := `CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);`
+
+	// Without exclusion, Plan detects a modification (column removal blocked by default)
+	_, err = migratex.Plan(ctx, db, schema, false, nil)
+	if err == nil {
+		t.Fatal("expected error about removing columns without allow-deletions")
+	}
+
+	// With column exclusion, the extra column is ignored during diff
+	ops, err := migratex.Plan(ctx, db, schema, false, &migratex.Exclusions{
+		Columns: map[string][]string{
+			"users": {"internal_seq"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ops) != 0 {
+		for i, op := range ops {
+			t.Logf("  op[%d]: %s", i, op.Normalized())
+		}
+		t.Fatalf("expected 0 ops with excluded columns, got %d", len(ops))
+	}
+}
+
 func TestMigrateVirtualTable(t *testing.T) {
 	db, err := sql.Open("sqlite", "test_vt.db")
 	if err != nil {
@@ -168,13 +263,13 @@ func TestMigrateVirtualTable(t *testing.T) {
 	`
 
 	// Initial migration should succeed
-	err = migratex.Migrate(ctx, db, schema, false)
+	err = migratex.Migrate(ctx, db, schema, false, nil)
 	if err != nil {
 		t.Fatal("initial migration failed:", err)
 	}
 
 	// Plan with same schema should produce no operations (idempotent)
-	ops, err := migratex.Plan(ctx, db, schema, false)
+	ops, err := migratex.Plan(ctx, db, schema, false, nil)
 	if err != nil {
 		t.Fatal("plan failed:", err)
 	}
@@ -217,7 +312,7 @@ func TestMigrateVirtualTable(t *testing.T) {
 			tokenize='unicode61 remove_diacritics 1'
 		);
 	`
-	ops, err = migratex.Plan(ctx, db, modifiedSchema, false)
+	ops, err = migratex.Plan(ctx, db, modifiedSchema, false, nil)
 	if err != nil {
 		t.Fatal("plan with modified virtual table failed:", err)
 	}
@@ -255,7 +350,7 @@ func TestMigrateVirtualTable(t *testing.T) {
 			content=category, content_rowid=id
 		);
 	`
-	ops, err = migratex.Plan(ctx, db, extendedSchema, false)
+	ops, err = migratex.Plan(ctx, db, extendedSchema, false, nil)
 	if err != nil {
 		t.Fatal("plan with added virtual table failed:", err)
 	}

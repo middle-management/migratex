@@ -5,8 +5,8 @@ import (
 	"database/sql"
 )
 
-func Migrate(ctx context.Context, actual *sql.DB, schema string, allowDeletions bool) error {
-	ops, err := Plan(ctx, actual, schema, allowDeletions)
+func Migrate(ctx context.Context, actual *sql.DB, schema string, allowDeletions bool, exclusions *Exclusions) error {
+	ops, err := Plan(ctx, actual, schema, allowDeletions, exclusions)
 	if err != nil {
 		return err
 	}

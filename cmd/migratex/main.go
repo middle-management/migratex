@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
 	"os/signal"
 
 	"github.com/middle-management/migratex"
@@ -26,7 +27,32 @@ func main() {
 	flagSchema := flag.String("schema", getenv("SCHEMA", "/dev/stdin"), "path to schema ($SCHEMA)")
 	flagAutoApply := flag.Bool("auto-apply", false, "apply plan without asking")
 	flagAllowDeletions := flag.Bool("allow-deletions", false, "unless set deletions are not allowed")
+	flagExcludeTables := flag.String("exclude-tables", "", "comma-separated list of tables to exclude from migration")
+	flagExcludeColumns := flag.String("exclude-columns", "", "comma-separated list of table.column pairs to exclude from migration")
 	flag.Parse()
+
+	var exclusions *migratex.Exclusions
+	if *flagExcludeTables != "" || *flagExcludeColumns != "" {
+		exclusions = &migratex.Exclusions{
+			Columns: make(map[string][]string),
+		}
+		if *flagExcludeTables != "" {
+			for _, t := range strings.Split(*flagExcludeTables, ",") {
+				if t = strings.TrimSpace(t); t != "" {
+					exclusions.Tables = append(exclusions.Tables, t)
+				}
+			}
+		}
+		if *flagExcludeColumns != "" {
+			for _, tc := range strings.Split(*flagExcludeColumns, ",") {
+				tc = strings.TrimSpace(tc)
+				parts := strings.SplitN(tc, ".", 2)
+				if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+					exclusions.Columns[parts[0]] = append(exclusions.Columns[parts[0]], parts[1])
+				}
+			}
+		}
+	}
 
 	ctx := context.Background()
 	ctx, cancel := context.WithCancel(ctx)
@@ -68,7 +94,7 @@ func main() {
 	}
 
 	// create migration plan
-	ops, err := migratex.Plan(ctx, db, string(schema), *flagAllowDeletions)
+	ops, err := migratex.Plan(ctx, db, string(schema), *flagAllowDeletions, exclusions)
 	if err != nil {
 		log.Fatal(err)
 	}
