@@ -362,3 +362,293 @@ func TestMigrateVirtualTable(t *testing.T) {
 		t.Fatalf("expected 2 ops (add table + add virtual table), got %d", len(ops))
 	}
 }
+
+func TestMigrateGeneratedColumn(t *testing.T) {
+	db, err := sql.Open("sqlite", "test_gencol.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove("test_gencol.db")
+	defer db.Close()
+
+	ctx := context.TODO()
+
+	schema := `
+		CREATE TABLE item (
+			id INTEGER PRIMARY KEY,
+			price INTEGER NOT NULL,
+			tax INTEGER NOT NULL,
+			total INTEGER GENERATED ALWAYS AS (price + tax) VIRTUAL
+		);
+	`
+
+	if err := migratex.Migrate(ctx, db, schema, false, nil); err != nil {
+		t.Fatal("initial migration failed:", err)
+	}
+
+	ops, err := migratex.Plan(ctx, db, schema, false, nil)
+	if err != nil {
+		t.Fatal("plan failed:", err)
+	}
+	if len(ops) != 0 {
+		for i, op := range ops {
+			t.Logf("  op[%d]: %s", i, op.Normalized())
+		}
+		t.Fatalf("expected 0 ops for identical generated-column schema, got %d", len(ops))
+	}
+
+	if _, err := db.ExecContext(ctx, `INSERT INTO item (price, tax) VALUES (100, 7)`); err != nil {
+		t.Fatal("insert failed:", err)
+	}
+	var total int
+	if err := db.QueryRowContext(ctx, `SELECT total FROM item`).Scan(&total); err != nil {
+		t.Fatal("select failed:", err)
+	}
+	if total != 107 {
+		t.Errorf("expected total=107, got %d", total)
+	}
+}
+
+func TestMigrateStrictTable(t *testing.T) {
+	db, err := sql.Open("sqlite", "test_strict.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove("test_strict.db")
+	defer db.Close()
+
+	ctx := context.TODO()
+
+	schema := `
+		CREATE TABLE account (
+			id INTEGER PRIMARY KEY,
+			name TEXT NOT NULL,
+			balance INTEGER NOT NULL
+		) STRICT;
+	`
+
+	if err := migratex.Migrate(ctx, db, schema, false, nil); err != nil {
+		t.Fatal("initial migration failed:", err)
+	}
+
+	ops, err := migratex.Plan(ctx, db, schema, false, nil)
+	if err != nil {
+		t.Fatal("plan failed:", err)
+	}
+	if len(ops) != 0 {
+		for i, op := range ops {
+			t.Logf("  op[%d]: %s", i, op.Normalized())
+		}
+		t.Fatalf("expected 0 ops for identical STRICT schema, got %d", len(ops))
+	}
+
+	// STRICT should reject non-INTEGER values for INTEGER columns
+	if _, err := db.ExecContext(ctx, `INSERT INTO account (name, balance) VALUES ('a', 'not-an-int')`); err == nil {
+		t.Error("expected STRICT table to reject non-integer balance")
+	}
+}
+
+func TestMigrateWithoutRowid(t *testing.T) {
+	db, err := sql.Open("sqlite", "test_worid.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove("test_worid.db")
+	defer db.Close()
+
+	ctx := context.TODO()
+
+	schema := `
+		CREATE TABLE kv (
+			k TEXT PRIMARY KEY,
+			v TEXT
+		) WITHOUT ROWID;
+	`
+
+	if err := migratex.Migrate(ctx, db, schema, false, nil); err != nil {
+		t.Fatal("initial migration failed:", err)
+	}
+
+	ops, err := migratex.Plan(ctx, db, schema, false, nil)
+	if err != nil {
+		t.Fatal("plan failed:", err)
+	}
+	if len(ops) != 0 {
+		for i, op := range ops {
+			t.Logf("  op[%d]: %s", i, op.Normalized())
+		}
+		t.Fatalf("expected 0 ops for identical WITHOUT ROWID schema, got %d", len(ops))
+	}
+
+	if _, err := db.ExecContext(ctx, `INSERT INTO kv VALUES ('hello', 'world')`); err != nil {
+		t.Fatal("insert failed:", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO kv VALUES ('hello', 'dup')`); err == nil {
+		t.Error("expected primary key conflict on duplicate insert")
+	}
+}
+
+func TestMigrateCheckConstraint(t *testing.T) {
+	db, err := sql.Open("sqlite", "test_check.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove("test_check.db")
+	defer db.Close()
+
+	ctx := context.TODO()
+
+	schema := `
+		CREATE TABLE event (
+			id INTEGER PRIMARY KEY,
+			level TEXT CHECK (level IN ('info', 'warn', 'error'))
+		);
+	`
+
+	if err := migratex.Migrate(ctx, db, schema, false, nil); err != nil {
+		t.Fatal("initial migration failed:", err)
+	}
+
+	ops, err := migratex.Plan(ctx, db, schema, false, nil)
+	if err != nil {
+		t.Fatal("plan failed:", err)
+	}
+	if len(ops) != 0 {
+		for i, op := range ops {
+			t.Logf("  op[%d]: %s", i, op.Normalized())
+		}
+		t.Fatalf("expected 0 ops for identical CHECK schema, got %d", len(ops))
+	}
+
+	if _, err := db.ExecContext(ctx, `INSERT INTO event (level) VALUES ('debug')`); err == nil {
+		t.Error("expected CHECK constraint to reject 'debug'")
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO event (level) VALUES ('info')`); err != nil {
+		t.Errorf("expected 'info' to be accepted: %v", err)
+	}
+}
+
+func TestMigratePartialIndex(t *testing.T) {
+	db, err := sql.Open("sqlite", "test_partial.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove("test_partial.db")
+	defer db.Close()
+
+	ctx := context.TODO()
+
+	schema := `
+		CREATE TABLE task (
+			id INTEGER PRIMARY KEY,
+			status TEXT,
+			priority INTEGER
+		);
+		CREATE INDEX idx_active_high_priority ON task (priority) WHERE status = 'active';
+	`
+
+	if err := migratex.Migrate(ctx, db, schema, false, nil); err != nil {
+		t.Fatal("initial migration failed:", err)
+	}
+
+	ops, err := migratex.Plan(ctx, db, schema, false, nil)
+	if err != nil {
+		t.Fatal("plan failed:", err)
+	}
+	if len(ops) != 0 {
+		for i, op := range ops {
+			t.Logf("  op[%d]: %s", i, op.Normalized())
+		}
+		t.Fatalf("expected 0 ops for identical partial-index schema, got %d", len(ops))
+	}
+
+	// Changing the WHERE clause should regenerate the index
+	changed := `
+		CREATE TABLE task (
+			id INTEGER PRIMARY KEY,
+			status TEXT,
+			priority INTEGER
+		);
+		CREATE INDEX idx_active_high_priority ON task (priority) WHERE status = 'pending';
+	`
+	ops, err = migratex.Plan(ctx, db, changed, false, nil)
+	if err != nil {
+		t.Fatal("plan with changed partial index failed:", err)
+	}
+	if len(ops) != 2 {
+		for i, op := range ops {
+			t.Logf("  op[%d]: %s", i, op.Normalized())
+		}
+		t.Fatalf("expected 2 ops (drop + create) for changed partial index, got %d", len(ops))
+	}
+}
+
+func TestMigrateForeignKeyRebuild(t *testing.T) {
+	db, err := sql.Open("sqlite", "test_fk.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove("test_fk.db")
+	defer db.Close()
+
+	ctx := context.TODO()
+
+	schema := `
+		CREATE TABLE author (
+			id INTEGER PRIMARY KEY,
+			name TEXT NOT NULL
+		);
+		CREATE TABLE book (
+			id INTEGER PRIMARY KEY,
+			author_id INTEGER NOT NULL REFERENCES author(id),
+			title TEXT NOT NULL
+		);
+	`
+
+	if err := migratex.Migrate(ctx, db, schema, false, nil); err != nil {
+		t.Fatal("initial migration failed:", err)
+	}
+
+	if _, err := db.ExecContext(ctx, `INSERT INTO author (id, name) VALUES (1, 'Ada')`); err != nil {
+		t.Fatal("author insert failed:", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO book (author_id, title) VALUES (1, 'Notes')`); err != nil {
+		t.Fatal("book insert failed:", err)
+	}
+
+	// Add a column to the parent table; this triggers a rebuild of `author`.
+	updated := `
+		CREATE TABLE author (
+			id INTEGER PRIMARY KEY,
+			name TEXT NOT NULL,
+			bio TEXT
+		);
+		CREATE TABLE book (
+			id INTEGER PRIMARY KEY,
+			author_id INTEGER NOT NULL REFERENCES author(id),
+			title TEXT NOT NULL
+		);
+	`
+	if err := migratex.Migrate(ctx, db, updated, false, nil); err != nil {
+		t.Fatal("rebuild migration failed:", err)
+	}
+
+	// Existing data must survive the rebuild.
+	var name, title string
+	if err := db.QueryRowContext(ctx, `
+		SELECT a.name, b.title FROM author a JOIN book b ON b.author_id = a.id
+	`).Scan(&name, &title); err != nil {
+		t.Fatal("post-rebuild join failed:", err)
+	}
+	if name != "Ada" || title != "Notes" {
+		t.Errorf("expected Ada/Notes, got %q/%q", name, title)
+	}
+
+	// FK enforcement should still reject orphan inserts.
+	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys = ON`); err != nil {
+		t.Fatal("enabling foreign_keys failed:", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO book (author_id, title) VALUES (999, 'orphan')`); err == nil {
+		t.Error("expected FK violation for orphan author_id")
+	}
+}

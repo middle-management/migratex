@@ -2,11 +2,11 @@ package migratex
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
-	"math/rand"
 	"regexp"
-	"strconv"
 	"strings"
 )
 
@@ -214,7 +214,6 @@ func Plan(ctx context.Context, actual *sql.DB, schema string, allowDeletions boo
 		addOperation(fmt.Sprintf(`DROP TABLE "%s"`, name))
 	}
 
-	suffix := "_migratex_" + strconv.Itoa(rand.Int())
 	for _, tableName := range modifiedTables {
 		wantedColumns, err := mapKeyValue(ctx, wanted, sqlColumns, tableName)
 		if err != nil {
@@ -247,8 +246,12 @@ func Plan(ctx context.Context, actual *sql.DB, schema string, allowDeletions boo
 			return nil, fmt.Errorf("will not remove columns from table %s: %v", tableName, removedColumns)
 		}
 
+		var suffixBytes [8]byte
+		if _, err := cryptorand.Read(suffixBytes[:]); err != nil {
+			return nil, err
+		}
 		// TODO make the replace a bit safer (this would replace columns and everything)
-		tmpName := tableName + suffix
+		tmpName := tableName + "_migratex_" + hex.EncodeToString(suffixBytes[:])
 		sql := strings.ReplaceAll(wantedTables[tableName], tableName, tmpName)
 		addOperation(sql)
 
