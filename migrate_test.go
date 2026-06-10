@@ -363,6 +363,107 @@ func TestMigrateVirtualTable(t *testing.T) {
 	}
 }
 
+func TestMigrateFTSWithTriggers(t *testing.T) {
+	db, err := sql.Open("sqlite", "test_fts_triggers.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove("test_fts_triggers.db")
+	defer db.Close()
+
+	ctx := context.TODO()
+
+	// Canonical FTS5 external-content setup: a content table whose rows are
+	// mirrored into the FTS index by AFTER INSERT/UPDATE/DELETE triggers.
+	// This exercises the interaction between the virtual table, the shadow
+	// tables it creates (docs_fts_data, _idx, _docsize, _config, _content),
+	// and the sync triggers all at once.
+	schema := `
+		CREATE TABLE docs (
+			id INTEGER PRIMARY KEY,
+			title TEXT,
+			body TEXT
+		);
+		CREATE VIRTUAL TABLE docs_fts USING fts5(
+			title, body,
+			content='docs', content_rowid='id'
+		);
+		CREATE TRIGGER docs_ai AFTER INSERT ON docs BEGIN
+			INSERT INTO docs_fts (rowid, title, body) VALUES (new.id, new.title, new.body);
+		END;
+		CREATE TRIGGER docs_ad AFTER DELETE ON docs BEGIN
+			INSERT INTO docs_fts (docs_fts, rowid, title, body) VALUES ('delete', old.id, old.title, old.body);
+		END;
+		CREATE TRIGGER docs_au AFTER UPDATE ON docs BEGIN
+			INSERT INTO docs_fts (docs_fts, rowid, title, body) VALUES ('delete', old.id, old.title, old.body);
+			INSERT INTO docs_fts (rowid, title, body) VALUES (new.id, new.title, new.body);
+		END;
+	`
+
+	// Initial migration should create the table, the FTS index, and the triggers.
+	if err := migratex.Migrate(ctx, db, schema, false, nil); err != nil {
+		t.Fatal("initial migration failed:", err)
+	}
+
+	// Re-planning with the identical schema must produce no operations. This
+	// proves the FTS5 shadow tables are filtered out (rather than detected as
+	// tables to drop) and that the triggers round-trip cleanly.
+	ops, err := migratex.Plan(ctx, db, schema, false, nil)
+	if err != nil {
+		t.Fatal("plan failed:", err)
+	}
+	if len(ops) != 0 {
+		for i, op := range ops {
+			t.Logf("  op[%d]: %s", i, op.Normalized())
+		}
+		t.Fatalf("expected 0 ops for identical FTS+triggers schema, got %d", len(ops))
+	}
+
+	// Writing only to the content table should keep the FTS index in sync via
+	// the triggers, so a MATCH query returns the inserted row.
+	if _, err := db.ExecContext(ctx, `INSERT INTO docs (id, title, body) VALUES (1, 'Hello', 'the quick brown fox')`); err != nil {
+		t.Fatal("insert failed:", err)
+	}
+	var title string
+	if err := db.QueryRowContext(ctx, `SELECT title FROM docs_fts WHERE docs_fts MATCH 'brown'`).Scan(&title); err != nil {
+		t.Fatal("fts match after insert failed:", err)
+	}
+	if title != "Hello" {
+		t.Errorf("expected 'Hello', got %q", title)
+	}
+
+	// Updating the content table should re-index via the AFTER UPDATE trigger:
+	// the old term no longer matches and the new term does.
+	if _, err := db.ExecContext(ctx, `UPDATE docs SET body = 'lazy dog' WHERE id = 1`); err != nil {
+		t.Fatal("update failed:", err)
+	}
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM docs_fts WHERE docs_fts MATCH 'brown'`).Scan(&count); err != nil {
+		t.Fatal("fts match after update failed:", err)
+	}
+	if count != 0 {
+		t.Errorf("expected stale term 'brown' to be re-indexed away, got %d matches", count)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM docs_fts WHERE docs_fts MATCH 'dog'`).Scan(&count); err != nil {
+		t.Fatal("fts match for new term failed:", err)
+	}
+	if count != 1 {
+		t.Errorf("expected new term 'dog' to be indexed, got %d matches", count)
+	}
+
+	// Deleting from the content table should remove the row from the FTS index
+	// via the AFTER DELETE trigger.
+	if _, err := db.ExecContext(ctx, `DELETE FROM docs WHERE id = 1`); err != nil {
+		t.Fatal("delete failed:", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM docs_fts WHERE docs_fts MATCH 'dog'`).Scan(&count); err != nil {
+		t.Fatal("fts match after delete failed:", err)
+	}
+	if count != 0 {
+		t.Errorf("expected deleted row to be removed from FTS index, got %d matches", count)
+	}
+}
+
 func TestMigrateGeneratedColumn(t *testing.T) {
 	db, err := sql.Open("sqlite", "test_gencol.db")
 	if err != nil {
